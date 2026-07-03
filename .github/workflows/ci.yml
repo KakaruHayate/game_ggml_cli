@@ -79,24 +79,33 @@ jobs:
           vulkan-query-version: latest
           vulkan-components: Vulkan-Headers,Vulkan-Loader
           vulkan-use-cache: true
-      - name: Add glslc to PATH (Linux)
+      - name: Add glslc to PATH and fix VULKAN_SDK (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # The action extracts SDK under the workspace; search for glslc.
-          GLSC=$(find "${{ github.workspace }}" -name "glslc" -type f 2>/dev/null | head -1)
+          # Find the actual glslc binary and update VULKAN_SDK to its parent.
+          GLSC=$(find "${{ github.workspace }}"/_vulkan_build -name "glslc" -type f 2>/dev/null | head -1)
           if [ -z "$GLSC" ]; then
-            GLSC=$(find /usr/local -name "glslc" -type f 2>/dev/null | head -1)
+            GLSC=$(find "${{ github.workspace }}" -name "glslc" -type f 2>/dev/null | head -1)
           fi
           if [ -n "$GLSC" ]; then
             BIN_DIR=$(dirname "$GLSC")
+            SDK_ROOT=$(cd "$BIN_DIR/.." && pwd)
+            echo "VULKAN_SDK=$SDK_ROOT" >> "$GITHUB_ENV"
             echo "$BIN_DIR" >> "$GITHUB_PATH"
-            echo "Added $BIN_DIR to PATH (glslc=$GLSC)"
+            echo "VULKAN_SDK=$SDK_ROOT (glslc=$GLSC)"
           else
             echo "::error::glslc not found after Vulkan SDK install"
             exit 1
           fi
           which glslc && glslc --version
+
+          # macos-x64-metal: disable native CPU detection for cross-compile
+      - name: Disable native CPU for cross-compile (macOS x86_64 only)
+        if: matrix.name == 'macos-x64-metal'
+        shell: bash
+        run: |
+          echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
 
       - name: Install Vulkan SDK (Windows only)
         if: runner.os == 'Windows'
@@ -109,23 +118,36 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $glslc = Get-Command glslc -ErrorAction SilentlyContinue
-          if (-not $glslc) {
-            # Search common locations
-            $dirs = @(
-              Join-Path $env:VULKAN_SDK 'Bin',
-              'C:\VulkanSDK\Bin',
-              'C:\Program Files\VulkanSDK\Bin'
-            )
-            foreach ($d in $dirs) {
-              if (Test-Path (Join-Path $d 'glslc.exe')) {
-                $env:PATH = "$d;$env:PATH"
-                Write-Host "Added $d to PATH"
-                break
+          # Find glslc.exe in the SDK tree or VULKAN_SDK.
+          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK')
+          if (-not $vulkan -or -not (Test-Path $vulkan)) {
+            $vulkan = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue
+              | Sort-Object Name -Descending | Select-Object -First 1
+          }
+          if ($vulkan) {
+            Write-Host "VULKAN_SDK=$vulkan"
+            $bin = Join-Path $vulkan 'Bin'
+            if (Test-Path (Join-Path $bin 'glslc.exe')) {
+              echo "VULKAN_SDK=$vulkan" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              echo "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Get-Command glslc | Select-Object Source
+            } else {
+              Write-Host "glslc not found in $bin, searching recursively..."
+              $found = Get-ChildItem -Recurse -Filter 'glslc.exe' -Path $vulkan -ErrorAction SilentlyContinue
+                | Select-Object -First 1
+              if ($found) {
+                $bin = $found.DirectoryName
+                echo "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                Get-Command glslc | Select-Object Source
+              } else {
+                Write-Error "glslc.exe not found under VULKAN_SDK"
+                exit 1
               }
             }
+          } else {
+            Write-Error "Vulkan SDK not found"
+            exit 1
           }
-          Get-Command glslc | Select-Object Source
 
       - name: Cache CMake FetchContent
         uses: actions/cache@v4
@@ -141,6 +163,7 @@ jobs:
                 -DCMAKE_BUILD_TYPE=Release \
                 -DGAME_GGML_BUILD_CLI=ON \
                 -DGAME_GGML_BUILD_TESTS=OFF \
+                ${GGML_NATIVE:+-DGGML_NATIVE=$GGML_NATIVE} \
                 ${{ matrix.cmake_extra }}
 
       - name: Build
