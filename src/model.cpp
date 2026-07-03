@@ -1,0 +1,477 @@
+#include "model_impl.h"
+
+#include "backend.h"
+#include "d3pm.h"
+#include "game_ggml/decode.h"
+#include "game_ggml/errors.h"
+#include "ops_basic.h"
+#include "ops_joint_attn.h"
+#include "rng.h"
+
+#include <ggml-alloc.h>
+#include <ggml-backend.h>
+#include <ggml.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <random>
+#include <vector>
+
+namespace game_ggml {
+
+// ============================================================================
+// Model — public facade
+// ============================================================================
+
+Model::Model() = default;
+Model::~Model() = default;
+Model::Model(Model &&) noexcept = default;
+Model & Model::operator=(Model &&) noexcept = default;
+
+Model Model::load(const std::string & gguf_path) {
+    Model m;
+    m.impl_ = Impl::load(gguf_path);
+    return m;
+}
+
+const GameModelConfig & Model::config() const noexcept { return impl_->cfg; }
+Model::Impl & Model::internals() noexcept { return *impl_; }
+
+InferResult Model::infer(const float * waveform, std::size_t n_samples,
+                         const InferParams & params) {
+    std::uint64_t seed = params.seed;
+    if (seed == 0) seed = std::random_device{}();
+    internal::MT19937Rng rng(seed);
+    return impl_->infer_with_rng(waveform, n_samples, params, rng);
+}
+
+// ============================================================================
+// Model::Impl — loading
+// ============================================================================
+
+Model::Impl::~Impl() {
+    if (backend) internal::free_backend(backend);
+}
+
+std::unique_ptr<Model::Impl> Model::Impl::load(const std::string & path) {
+    auto impl = std::make_unique<Impl>();
+    impl->gguf    = std::make_unique<internal::GgufFile>(internal::GgufFile::open(path));
+    impl->cfg     = internal::load_config(*impl->gguf);
+    impl->backend = internal::init_best_backend();
+    impl->weights = std::make_unique<internal::LoadedWeights>(
+        internal::LoadedWeights::load_all(*impl->gguf, impl->backend));
+
+    // Top-level weights.
+    impl->w_spec_proj = impl->weights->get("spectrogram_projection.weight");
+    impl->b_spec_proj = impl->weights->get("spectrogram_projection.bias");
+
+    // Sub-models.
+    impl->encoder_w   = internal::bind_encoder_weights(*impl->weights, impl->cfg.encoder, "encoder");
+    impl->segmenter_w = internal::bind_segmenter_weights(*impl->weights, impl->cfg);
+    impl->estimator_w = internal::bind_estimator_weights(*impl->weights, impl->cfg);
+
+    // Front-end.
+    MelConfig mc;
+    mc.sample_rate = impl->cfg.inference.audio_sample_rate;
+    mc.n_fft       = impl->cfg.inference.fft_size;
+    mc.win_length  = impl->cfg.inference.win_size;
+    mc.hop_length  = impl->cfg.inference.hop_size;
+    mc.n_mels      = impl->cfg.inference.n_mels;
+    mc.fmin        = impl->cfg.inference.fmin;
+    mc.fmax        = impl->cfg.inference.fmax;
+    impl->mel_extractor = std::make_unique<MelExtractor>(mc);
+
+    return impl;
+}
+
+// ============================================================================
+// Stage helpers — each owns its own ggml_context + graph
+// ============================================================================
+
+namespace {
+
+// Thin guard making a temporary ggml_context + gallocr used by a single stage.
+struct StageCtx {
+    ggml_context * ctx     = nullptr;
+    ggml_cgraph  * graph   = nullptr;
+    ggml_gallocr_t alloc   = nullptr;
+    ggml_backend_t backend = nullptr;
+
+    StageCtx(ggml_backend_t b, std::size_t mem_bytes, int graph_nodes) {
+        backend = b;
+        ggml_init_params ip{};
+        ip.mem_size = mem_bytes;
+        ip.no_alloc = true;
+        ctx = ggml_init(ip);
+        graph = ggml_new_graph_custom(ctx, graph_nodes, /*grads=*/false);
+    }
+
+    void finalize(ggml_tensor * out) {
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_alloc_graph(alloc, graph)) {
+            throw Error("ggml_gallocr_alloc_graph failed");
+        }
+    }
+
+    void compute() {
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            throw Error("graph compute failed");
+        }
+    }
+
+    ~StageCtx() {
+        if (alloc) ggml_gallocr_free(alloc);
+        if (ctx)   ggml_free(ctx);
+    }
+};
+
+}  // namespace
+
+// ============================================================================
+// Stage 1 — encoder (mel → x_seg, x_est)
+// ============================================================================
+
+void Model::Impl::run_encoder(const float * mel, int T,
+                              std::vector<float> & x_seg_out,
+                              std::vector<float> & x_est_out)
+{
+    const int D_mel = cfg.in_dim;
+    const int D_emb = cfg.embedding_dim;
+
+    StageCtx s(backend, 384 * 1024 * 1024, 16384);
+
+    ggml_tensor * mel_in = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32, D_mel, T, 1);
+    ggml_set_input(mel_in);
+    ggml_tensor * pos = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, T);
+    ggml_set_input(pos);
+
+    // spectrogram_projection (mel → D_embed)
+    ggml_tensor * x_proj = internal::ops::linear(s.ctx, mel_in, w_spec_proj, b_spec_proj);
+    auto outs = internal::build_encoder_graph(s.ctx, x_proj, encoder_w, pos, cfg.encoder);
+
+    ggml_set_output(outs.x_seg);
+    ggml_set_output(outs.x_est);
+    ggml_build_forward_expand(s.graph, outs.x_seg);
+    ggml_build_forward_expand(s.graph, outs.x_est);
+    s.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(s.alloc, s.graph)) throw Error("alloc failed (encoder)");
+
+    ggml_backend_tensor_set(mel_in, mel, 0, ggml_nbytes(mel_in));
+    std::vector<std::int32_t> pos_i(T);
+    for (int i = 0; i < T; ++i) pos_i[i] = i;
+    ggml_backend_tensor_set(pos, pos_i.data(), 0, pos_i.size() * sizeof(std::int32_t));
+
+    s.compute();
+
+    x_seg_out.resize(ggml_nelements(outs.x_seg));
+    x_est_out.resize(ggml_nelements(outs.x_est));
+    ggml_backend_tensor_get(outs.x_seg, x_seg_out.data(), 0, x_seg_out.size() * sizeof(float));
+    ggml_backend_tensor_get(outs.x_est, x_est_out.data(), 0, x_est_out.size() * sizeof(float));
+}
+
+// ============================================================================
+// Stage 2 — segmenter (one D3PM step)
+// ============================================================================
+
+void Model::Impl::run_segmenter_step(
+    const float * x_seg_host, int T,
+    const std::int32_t * noise_mod3, float t_scalar, int language,
+    std::vector<float> & logits_out)
+{
+    const int D = cfg.embedding_dim;
+
+    StageCtx s(backend, 768 * 1024 * 1024, 32768);
+
+    ggml_tensor * xseg        = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32, D, T, 1);
+    ggml_tensor * noise       = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, T);
+    ggml_tensor * t_tensor    = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32, 1, 1, 1);
+    ggml_tensor * lang_tensor = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * positions   = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, T);
+    for (auto * t : {xseg, noise, t_tensor, lang_tensor, positions}) ggml_set_input(t);
+
+    auto outs = internal::build_segmenter_graph(
+        s.ctx, xseg, noise, t_tensor, lang_tensor, positions, segmenter_w, cfg);
+
+    ggml_set_output(outs.logits);
+    ggml_build_forward_expand(s.graph, outs.logits);
+    s.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(s.alloc, s.graph)) throw Error("alloc failed (segmenter)");
+
+    ggml_backend_tensor_set(xseg,        x_seg_host, 0, ggml_nbytes(xseg));
+    ggml_backend_tensor_set(noise,       noise_mod3, 0, T * sizeof(std::int32_t));
+    ggml_backend_tensor_set(t_tensor,    &t_scalar,  0, sizeof(float));
+    const std::int32_t l = static_cast<std::int32_t>(language);
+    ggml_backend_tensor_set(lang_tensor, &l, 0, sizeof(std::int32_t));
+    std::vector<std::int32_t> pos(T);
+    for (int i = 0; i < T; ++i) pos[i] = i;
+    ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(std::int32_t));
+
+    s.compute();
+
+    logits_out.resize(T);
+    ggml_backend_tensor_get(outs.logits, logits_out.data(), 0, logits_out.size() * sizeof(float));
+}
+
+// ============================================================================
+// Stage 3 — estimator (regions → pool_logits)
+// ============================================================================
+
+void Model::Impl::run_estimator(
+    const float * x_est_host, int T,
+    const std::int32_t * regions, int N,
+    std::vector<float> & pool_logits_out)
+{
+    const int D = cfg.embedding_dim;
+    const int S = N + T;
+
+    StageCtx s(backend, 768 * 1024 * 1024, 32768);
+
+    ggml_tensor * xest        = ggml_new_tensor_3d(s.ctx, GGML_TYPE_F32, D, T, 1);
+    ggml_tensor * regions_mod = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, T);
+    ggml_tensor * positions   = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, S);
+    ggml_tensor * region_ids  = ggml_new_tensor_1d(s.ctx, GGML_TYPE_I32, S);
+    ggml_tensor * mask_fp16   = ggml_new_tensor_4d(s.ctx, GGML_TYPE_F16, S, S, 1, 1);
+    for (auto * t : {xest, regions_mod, positions, region_ids, mask_fp16}) ggml_set_input(t);
+
+    auto outs = internal::build_estimator_graph(
+        s.ctx, xest, regions_mod, positions, region_ids, mask_fp16, N, estimator_w, cfg);
+
+    ggml_set_output(outs.pool_logits);
+    ggml_build_forward_expand(s.graph, outs.pool_logits);
+    s.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(s.alloc, s.graph)) throw Error("alloc failed (estimator)");
+
+    // Host-side prep.
+    ggml_backend_tensor_set(xest, x_est_host, 0, ggml_nbytes(xest));
+
+    std::vector<std::int32_t> rmod(T);
+    for (int i = 0; i < T; ++i) rmod[i] = regions[i] % cfg.region_cycle_len;
+    ggml_backend_tensor_set(regions_mod, rmod.data(), 0, rmod.size() * sizeof(std::int32_t));
+
+    // Global positions: pool 0..N-1, x 0..T-1
+    std::vector<std::int32_t> gpos(S);
+    for (int i = 0; i < N; ++i) gpos[i] = i;
+    for (int i = 0; i < T; ++i) gpos[N + i] = i;
+    ggml_backend_tensor_set(positions, gpos.data(), 0, gpos.size() * sizeof(std::int32_t));
+
+    // Region RoPE indices: pool = 0 (R=1, use_pool_offset=false);
+    // x = local_position_within_region + R (= +1).
+    std::vector<std::int32_t> ridx(S, 0);
+    {
+        int cur_region = 0;
+        int cur_local  = 0;
+        for (int i = 0; i < T; ++i) {
+            const int r = regions[i];
+            if (r != cur_region) { cur_region = r; cur_local = 0; }
+            ridx[N + i] = (r > 0) ? (cur_local + 1) : 0;
+            ++cur_local;
+        }
+    }
+    ggml_backend_tensor_set(region_ids, ridx.data(), 0, ridx.size() * sizeof(std::int32_t));
+
+    auto mask = internal::ops::build_joint_attn_mask_fp16(regions, T, N);
+    ggml_backend_tensor_set(mask_fp16, mask.data(), 0, mask.size() * sizeof(std::uint16_t));
+
+    s.compute();
+
+    pool_logits_out.resize(ggml_nelements(outs.pool_logits));
+    ggml_backend_tensor_get(outs.pool_logits, pool_logits_out.data(),
+                            0, pool_logits_out.size() * sizeof(float));
+}
+
+// ============================================================================
+// Main entry: D3PM-orchestrated end-to-end inference
+// ============================================================================
+
+namespace {
+
+std::vector<float> default_d3pm_schedule(float t0, int n_steps) {
+    std::vector<float> ts;
+    ts.reserve(n_steps);
+    const float step = (1.0f - t0) / static_cast<float>(n_steps);
+    for (int i = 0; i < n_steps; ++i) ts.push_back(t0 + i * step);
+    return ts;
+}
+
+inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+// Simple profiler, gated by the GAME_GGML_PROFILE env var.  Accumulates
+// wall-time per stage across chunks; emits a summary to stderr on destruction.
+// Stage boundaries follow the ONNX export contract (deployment/exporter.py):
+//   * "encoder" = waveform → (x_seg, x_est, maskT); absorbs mel + spec_proj
+//   * "segmenter" = x_seg + embeddings → boundary_logits, repeated per D3PM step
+//   * "estimator" = x_est + regions → note logits
+struct StageProfiler {
+    bool enabled;
+    using clock = std::chrono::steady_clock;
+    using dur   = std::chrono::duration<double>;
+
+    double encoder_s = 0.0, segmenter_s = 0.0, estimator_s = 0.0, decode_s = 0.0;
+    int    n_segmenter_steps = 0;
+
+    StageProfiler() {
+        const char * env = std::getenv("GAME_GGML_PROFILE");
+        enabled = (env && *env && env[0] != '0');
+    }
+
+    struct Scope {
+        StageProfiler * p;
+        double        * acc;
+        clock::time_point t0;
+        Scope(StageProfiler * p_, double * acc_) : p(p_), acc(acc_) {
+            if (p && p->enabled) t0 = clock::now();
+        }
+        ~Scope() {
+            if (p && p->enabled) *acc += dur(clock::now() - t0).count();
+        }
+    };
+
+    Scope scope_encoder()   { return Scope(this, &encoder_s); }
+    Scope scope_segmenter() { if (enabled) ++n_segmenter_steps; return Scope(this, &segmenter_s); }
+    Scope scope_estimator() { return Scope(this, &estimator_s); }
+    Scope scope_decode()    { return Scope(this, &decode_s); }
+
+    ~StageProfiler() {
+        if (!enabled) return;
+        const double total = encoder_s + segmenter_s + estimator_s + decode_s;
+        std::fprintf(stderr,
+            "\n[GAME_GGML_PROFILE] per-chunk stage timings (ONNX-aligned)\n"
+            "    encoder     %7.3f s  (%5.1f %%)   mel + spec_proj + 4× EBF\n"
+            "    segmenter   %7.3f s  (%5.1f %%)   over %d D3PM steps\n"
+            "    estimator   %7.3f s  (%5.1f %%)\n"
+            "    decode/cpu  %7.3f s  (%5.1f %%)\n"
+            "    ------------------------\n"
+            "    total       %7.3f s\n",
+            encoder_s,   100.0 * encoder_s    / total,
+            segmenter_s, 100.0 * segmenter_s  / total, n_segmenter_steps,
+            estimator_s, 100.0 * estimator_s  / total,
+            decode_s,    100.0 * decode_s     / total,
+            total);
+    }
+};
+
+}  // namespace
+
+InferResult Model::Impl::infer_with_rng(
+    const float * waveform, std::size_t n_samples,
+    const InferParams & params,
+    internal::IRandomSource & rng)
+{
+    using namespace internal;
+    StageProfiler prof;
+
+    const int D = cfg.embedding_dim;
+    const int T = mel_extractor->num_frames(n_samples);
+    if (T <= 0) throw InvalidArgument("waveform too short for one mel frame");
+
+    // --- 1) encoder (waveform → x_seg, x_est)  [ONNX: encoder.onnx]
+    //        covers: mel extraction, spectrogram_projection, 4× EBF blocks,
+    //        output split.  The mel sub-stage runs on CPU (pocketfft STFT
+    //        + mel filterbank mul + log); everything after is on the backend.
+    std::vector<float> x_seg_host, x_est_host;
+    {
+        auto _ = prof.scope_encoder();
+        auto mel = mel_extractor->forward(waveform, n_samples);          // [T, 80]
+        run_encoder(mel.data(), T, x_seg_host, x_est_host);
+    }
+
+    // --- 3) D3PM loop (segmenter)
+    std::vector<float> ts = params.d3pm_ts.empty()
+        ? default_d3pm_schedule(params.d3pm_t0, params.d3pm_nsteps)
+        : params.d3pm_ts;
+
+    std::vector<std::uint8_t> known(T, 0);
+    std::vector<std::uint8_t> mask(T, 1);
+    std::vector<std::uint8_t> boundaries(known);
+
+    std::vector<std::int32_t> noise_mod(T);
+    std::vector<float> probs(T);
+    std::vector<float> logits;
+
+    for (float ti : ts) {
+        {
+            auto _ = prof.scope_decode();
+            const float p = d3pm_time_schedule(ti);
+            std::vector<std::uint8_t> next(T);
+            remove_mutable_boundaries(boundaries.data(), known.data(), T, p, rng, next.data());
+            boundaries = std::move(next);
+
+            auto regions = game_ggml::boundaries_to_regions(
+                boundaries.data(), mask.data(), T);
+            for (int i = 0; i < T; ++i) noise_mod[i] = regions[i] % cfg.region_cycle_len;
+        }
+
+        {
+            auto _ = prof.scope_segmenter();
+            run_segmenter_step(x_seg_host.data(), T,
+                noise_mod.data(), ti, params.language, logits);
+        }
+
+        {
+            auto _ = prof.scope_decode();
+            for (int i = 0; i < T; ++i) probs[i] = sigmoid(logits[i]);
+            boundaries = game_ggml::decode_soft_boundaries(
+                probs.data(), T, known.data(), mask.data(),
+                params.boundary_threshold, params.boundary_radius);
+        }
+    }
+
+    // --- 4) regions + N
+    std::vector<std::int32_t> regions;
+    int N = 0;
+    {
+        auto _ = prof.scope_decode();
+        regions = game_ggml::boundaries_to_regions(
+            boundaries.data(), mask.data(), T);
+        for (int i = 0; i < T; ++i) N = std::max<int>(N, regions[i]);
+    }
+
+    InferResult result;
+    result.num_frames = T;
+    if (N == 0) return result;
+
+    // --- 5) estimator
+    std::vector<float> pool_logits;
+    { auto _ = prof.scope_estimator();
+      run_estimator(x_est_host.data(), T, regions.data(), N, pool_logits); }
+
+    // --- 6) pitch decode
+    {
+        auto _ = prof.scope_decode();
+        const int bins = cfg.estimator_out_dim;
+        std::vector<float> pool_probs(pool_logits.size());
+        for (std::size_t i = 0; i < pool_logits.size(); ++i) {
+            pool_probs[i] = sigmoid(pool_logits[i]);
+        }
+        auto dec = game_ggml::decode_gaussian_blurred_probs(
+            pool_probs.data(), static_cast<std::size_t>(N), static_cast<std::size_t>(bins),
+            cfg.inference.midi_min, cfg.inference.midi_max,
+            cfg.inference.midi_std * 3.0f,
+            params.note_threshold);
+
+        // --- 7) collect notes
+        const float timestep = cfg.inference.timestep();
+        std::vector<int> dur_frames(N + 1, 0);
+        for (int i = 0; i < T; ++i) {
+            if (regions[i] > 0 && regions[i] <= N) ++dur_frames[regions[i]];
+        }
+        float offset = 0.0f;
+        for (int n_idx = 0; n_idx < N; ++n_idx) {
+            Note nt;
+            nt.offset_seconds   = offset;
+            nt.duration_seconds = dur_frames[n_idx + 1] * timestep;
+            nt.pitch_midi       = dec.values[n_idx];
+            nt.voiced           = dec.presence[n_idx] != 0;
+            result.notes.push_back(nt);
+            offset += nt.duration_seconds;
+        }
+    }
+    return result;
+}
+
+}  // namespace game_ggml

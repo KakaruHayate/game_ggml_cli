@@ -1,0 +1,155 @@
+name: ci
+
+# Multi-platform build + oudep packaging for GAME-ggml CLI.
+# Produces platform-specific .oudep archives that OpenUtau can drag-drop install.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64-vulkan
+            backend: VULKAN
+            ext: ""
+          - os: macos-14
+            name: macos-arm64-metal
+            backend: METAL
+            ext: ""
+          - os: macos-13
+            name: macos-x64-metal
+            backend: METAL
+            ext: ""
+          - os: windows-latest
+            name: windows-x64-vulkan
+            backend: VULKAN
+            ext: ".exe"
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch numpy gguf pyyaml
+
+      - name: Cache CMake FetchContent
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DGAME_GGML_BUILD_CLI=ON \
+                -DGAME_GGML_BUILD_TESTS=OFF \
+                -DGAME_GGML_${{ matrix.backend }}=ON
+
+      - name: Build
+        run: cmake --build build -j --config Release
+
+      - name: Verify binary
+        run: |
+          ls -la build/bin/
+          build/bin/game_ggml_cli${{ matrix.ext }} --version || true
+
+      - name: Package .oudep
+        run: |
+          set -euo pipefail
+          BIN="game_ggml_cli${{ matrix.ext }}"
+          PKG="game_ggml-${{ matrix.name }}"
+          mkdir -p "$PKG"
+
+          # CLI binary
+          cp "build/bin/$BIN" "$PKG/"
+
+          # Shared libraries (DLLs / .so / .dylib)
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            find build/bin -maxdepth 1 -name "ggml*.dll" -exec cp {} "$PKG/" \;
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            # Vulkan loader is provided by the runner; ship CPU fallback libs
+            find build/bin -maxdepth 1 \( -name "libggml*.so*" -o -name "libggml*.so" \) -exec cp {} "$PKG/" \; 2>/dev/null || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            find build/bin -maxdepth 1 -name "libggml*.dylib" -exec cp {} "$PKG/" \;
+            # Metal shader cache (speeds up first inference)
+            find build -name "default.metallib" -exec cp {} "$PKG/" \; 2>/dev/null || true
+          fi
+
+          # oudep manifest
+          cat > "$PKG/oudep.yaml" <<EOF
+          id: game-ggml-medium
+          version: 0.1.0
+          description: GAME GGML inference engine (${{ matrix.name }}) + medium GGUF weights
+          entrypoints:
+            - loader: Executable
+              path: $BIN
+          EOF
+
+          ls -la "$PKG/"
+          echo "PKG_DIR=$PKG" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PKG_DIR }}
+          path: ${{ env.PKG_DIR }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip per-platform bundles
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            zip -r "../${name}.oudep.zip" "$dir"
+          done
+          cd ..
+          ls -la *.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true
+          fail_on_unmatched_files: true

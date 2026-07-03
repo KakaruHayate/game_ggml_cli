@@ -1,0 +1,20 @@
+# Requirements for ggml_backend/scripts/*.py (conversion + reference dump).
+#
+# These are decoupled from the main GAME training environment on purpose: they
+# need only what is necessary to read a checkpoint and write GGUF + NumPy.
+
+# Torch is needed to load model.pt checkpoints.  Any version >= 2.0 works.
+torch>=2.0
+
+# Numerics + GGUF writer.
+numpy>=1.24
+gguf>=0.10.0
+
+# Config / metadata.
+pyyaml>=6.0
+
+# Only for dump_reference.py E2E bits (task 9) and the test harness that
+# needs to read WAV for parity; kept lightweight so an offline converter
+# still runs without them.
+soundfile>=0.12   # optional
+librosa>=0.10     # optional (for mel reference parity)

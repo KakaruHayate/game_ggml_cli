@@ -1,0 +1,147 @@
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index fab7891..b5ea726 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -94,12 +94,62 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
+     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
+ }
+ 
++// --- MTLBinaryArchive PSO cache ---
++// Caches compiled pipeline state objects to disk so subsequent launches skip
++// the expensive newComputePipelineState compilation.
++
++static NSURL * ggml_metal_archive_url(void) {
++    const char * env = getenv("GGML_METAL_ARCHIVE_PATH");
++    if (env && env[0]) {
++        return [NSURL fileURLWithPath:[NSString stringWithUTF8String:env]];
++    }
++    NSString * home = NSHomeDirectory();
++    NSString * dir = [home stringByAppendingPathComponent:@".cache/ggml"];
++    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
++    return [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"pipelines.metallib"]];
++}
++
++static id<MTLBinaryArchive> ggml_metal_archive_load(id<MTLDevice> device) {
++    NSURL * url = ggml_metal_archive_url();
++    MTLBinaryArchiveDescriptor * desc = [MTLBinaryArchiveDescriptor new];
++    if ([[NSFileManager defaultManager] isReadableFileAtPath:[url path]]) {
++        desc.url = url;
++    }
++    NSError * error = nil;
++    id<MTLBinaryArchive> archive = [device newBinaryArchiveWithDescriptor:desc error:&error];
++#if !__has_feature(objc_arc)
++    [desc release];
++#endif
++    if (!archive) {
++        GGML_LOG_WARN("%s: failed to load binary archive: %s\n", __func__,
++                      error ? [[error description] UTF8String] : "unknown");
++    } else {
++        GGML_LOG_INFO("%s: loaded Metal binary archive from '%s'\n", __func__, [[url path] UTF8String]);
++    }
++    return archive;
++}
++
++static void ggml_metal_archive_save(id<MTLBinaryArchive> archive) {
++    if (!archive) return;
++    NSURL * url = ggml_metal_archive_url();
++    NSError * error = nil;
++    if (![archive serializeToURL:url error:&error]) {
++        GGML_LOG_WARN("%s: failed to save binary archive: %s\n", __func__,
++                      error ? [[error description] UTF8String] : "unknown");
++    } else {
++        GGML_LOG_INFO("%s: saved Metal binary archive to '%s'\n", __func__, [[url path] UTF8String]);
++    }
++}
++
+ struct ggml_metal_library {
+     id<MTLLibrary> obj;
+ 
+     ggml_metal_device_t dev;
+     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
+ 
++    id<MTLBinaryArchive> archive;
++    bool archive_dirty;
++
+     NSLock * lock;
+ };
+ 
+@@ -251,10 +301,12 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+ 
+     ggml_metal_library_t res = calloc(1, sizeof(struct ggml_metal_library));
+ 
+-    res->obj       = library;
+-    res->dev       = dev;
+-    res->pipelines = ggml_metal_pipelines_init();
+-    res->lock      = [NSLock new];
++    res->obj           = library;
++    res->dev           = dev;
++    res->pipelines     = ggml_metal_pipelines_init();
++    res->lock          = [NSLock new];
++    res->archive       = ggml_metal_archive_load(device);
++    res->archive_dirty = false;
+ 
+     return res;
+ }
+@@ -331,6 +383,14 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
+         return;
+     }
+ 
++    GGML_LOG_DEBUG("%s: archive=%p dirty=%d\n", __func__, (void*)lib->archive, lib->archive_dirty);
++    if (lib->archive_dirty) {
++        ggml_metal_archive_save(lib->archive);
++    }
++    if (lib->archive) {
++        [lib->archive release];
++    }
++
+     if (lib->obj) {
+         [lib->obj release];
+     }
+@@ -388,11 +448,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+ 
+     @autoreleasepool {
+         NSError * error = nil;
++        id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
++        id<MTLComputePipelineState> obj = nil;
+ 
+         NSString * base_func = [NSString stringWithUTF8String:base];
+ 
+-        GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
+-
+         id<MTLFunction> mtl_function;
+         if (!cv) {
+             mtl_function = [lib->obj newFunctionWithName:base_func];
+@@ -410,8 +470,31 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+             return res;
+         }
+ 
+-        id<MTLDevice> device = ggml_metal_device_get_obj(lib->dev);
+-        id<MTLComputePipelineState> obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
++        // Create PSO — use descriptor path if archive is available so Metal can
++        // look up pre-compiled GPU binaries from the archive (fast path).
++        // If archive misses, Metal still compiles from source transparently.
++        if (lib->archive) {
++            MTLComputePipelineDescriptor * desc = [MTLComputePipelineDescriptor new];
++            desc.computeFunction = mtl_function;
++            desc.binaryArchives = @[lib->archive];
++            error = nil;
++            obj = [device newComputePipelineStateWithDescriptor:desc
++                                                       options:MTLPipelineOptionNone
++                                                    reflection:nil
++                                                         error:&error];
++            if (obj) {
++                // Add to archive for next launch (no-op if already present)
++                NSError * archErr = nil;
++                if ([lib->archive addComputePipelineFunctionsWithDescriptor:desc error:&archErr]) {
++                    lib->archive_dirty = true;
++                }
++            }
++#if !__has_feature(objc_arc)
++            [desc release];
++#endif
++        } else {
++            obj = [device newComputePipelineStateWithFunction:mtl_function error:&error];
++        }
+ 
+         [mtl_function release];
+ 

@@ -1,0 +1,187 @@
+#include "ops_attn.h"
+
+#include "ops_basic.h"
+#include "ops_ffn.h"
+#include "ops_rope.h"
+
+#include <ggml.h>
+
+#include <cassert>
+#include <cmath>
+
+namespace game_ggml::internal::ops {
+
+// ---------------------------------------------------------------------------
+// Attention with RoPE
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Split a (2*D, T, B) tensor along ne[0] into two contiguous (D, T, B) views.
+// Both parts share memory with the input.
+struct ChunkPair {
+    ggml_tensor * first;
+    ggml_tensor * second;
+};
+
+ChunkPair chunk_two(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t half = x->ne[0] / 2;
+    const size_t  esize = ggml_element_size(x);
+    ggml_tensor * a = ggml_view_4d(ctx, x,
+        half, x->ne[1], x->ne[2], x->ne[3],
+        x->nb[1], x->nb[2], x->nb[3], /*offset=*/0);
+    ggml_tensor * b = ggml_view_4d(ctx, x,
+        half, x->ne[1], x->ne[2], x->ne[3],
+        x->nb[1], x->nb[2], x->nb[3], /*offset=*/half * esize);
+    return {a, b};
+}
+
+}  // namespace
+
+ggml_tensor * attention_with_rope(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    const AttentionWeights & W,
+    ggml_tensor * positions,
+    int num_heads,
+    int head_dim,
+    float theta) {
+    const int64_t attn_dim = num_heads * head_dim;
+    const int64_t T = x->ne[1];
+    const int64_t B = x->ne[2];
+
+    // Linear projections.
+    ggml_tensor * q   = linear(ctx, x, W.w_q,  W.b_q);        // (H*D, T, B)
+    ggml_tensor * kv  = linear(ctx, x, W.w_kv, W.b_kv);       // (2*H*D, T, B)
+    auto [k_flat, v_flat] = chunk_two(ctx, kv);
+
+    // Reshape to (D, H, T, B) so RoPE can be applied (ne[2] == T).
+    ggml_tensor * qr = ggml_reshape_4d(ctx, ggml_cont(ctx, q),      head_dim, num_heads, T, B);
+    ggml_tensor * kr = ggml_reshape_4d(ctx, ggml_cont(ctx, k_flat), head_dim, num_heads, T, B);
+    ggml_tensor * vr = ggml_reshape_4d(ctx, ggml_cont(ctx, v_flat), head_dim, num_heads, T, B);
+
+    // RoPE.
+    qr = apply_rope(ctx, qr, positions, head_dim, theta);   // (D, H, T, B)
+    kr = apply_rope(ctx, kr, positions, head_dim, theta);
+
+    // Permute to (D, T, H, B) for flash_attn_ext.
+    qr = ggml_cont(ctx, ggml_permute(ctx, qr, 0, 2, 1, 3));
+    kr = ggml_cont(ctx, ggml_permute(ctx, kr, 0, 2, 1, 3));
+    vr = ggml_cont(ctx, ggml_permute(ctx, vr, 0, 2, 1, 3));
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    ggml_tensor * o = ggml_flash_attn_ext(ctx, qr, kr, vr,
+        /*mask=*/nullptr, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+    // Output shape per ggml_flash_attn_ext: (D, H, T, B)
+    // — ne[1] = q->ne[2] = H; ne[2] = q->ne[1] = T.
+
+    // Flatten heads: (D, H, T, B) → (H*D, T, B).  This works because H*D is
+    // contiguous in memory (d varies innermost, then h).
+    o = ggml_cont(ctx, o);
+    o = ggml_reshape_3d(ctx, o, attn_dim, T, B);
+
+    // Output projection.
+    return linear(ctx, o, W.w_out, W.b_out);
+}
+
+// ---------------------------------------------------------------------------
+// PAC (parallel attention + CgMLP, merge path)
+// ---------------------------------------------------------------------------
+
+ggml_tensor * pac(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    const PACWeights & W,
+    ggml_tensor * positions,
+    int num_heads,
+    int head_dim,
+    float theta) {
+    // Attention branch
+    ggml_tensor * ax = rms_norm(ctx, x, W.w_a_norm);
+    ggml_tensor * a  = attention_with_rope(ctx, ax, W.attn, positions,
+                                           num_heads, head_dim, theta);
+
+    // CgMLP branch
+    ggml_tensor * cx = rms_norm(ctx, x, W.w_c_norm);
+    ggml_tensor * c  = cgmlp(ctx, cx,
+        W.w_cg_pw1, W.b_cg_pw1,
+        W.w_cg_norm,
+        W.w_cg_dw,  W.b_cg_dw,
+        W.w_cg_pw2, W.b_cg_pw2,
+        W.cg_kernel_size);
+
+    // Concatenate along ne[0] (the channel/D axis).
+    ggml_tensor * m = ggml_concat(ctx, a, c, /*dim=*/0);   // (2D, T, B)
+
+    // Optional depthwise conv on the concatenated channels.
+    if (W.merge_kernel_size != 0 && W.w_merge_dw) {
+        // Permute (2D, T, B) → (T, 2D, B) for ggml_conv_1d_dw input layout.
+        ggml_tensor * m_tr = ggml_cont(ctx, ggml_permute(ctx, m, 1, 0, 2, 3));
+        const int stride = 1;
+        const int pad    = (W.merge_kernel_size - 1) / 2;
+        const int dil    = 1;
+        ggml_tensor * cv = ggml_conv_1d_dw(ctx, W.w_merge_dw, m_tr, stride, pad, dil);
+        // Per-channel bias: (2D,) broadcast over (T, 2D, B) — view with ne=(1, 2D, 1, 1).
+        if (W.b_merge_dw) {
+            const size_t esize = ggml_element_size(W.b_merge_dw);
+            const int64_t C = W.b_merge_dw->ne[0];
+            ggml_tensor * b4 = ggml_view_4d(ctx, W.b_merge_dw,
+                1, C, 1, 1,
+                esize, C * esize, C * esize,
+                0);
+            cv = ggml_add(ctx, cv, b4);
+        }
+        // Permute back (T, 2D, B) → (2D, T, B)
+        ggml_tensor * cv_back = ggml_cont(ctx, ggml_permute(ctx, cv, 1, 0, 2, 3));
+        m = ggml_add(ctx, cv_back, m);
+    }
+
+    return linear(ctx, m, W.w_merge_linear, W.b_merge_linear);
+}
+
+// ---------------------------------------------------------------------------
+// EBF block
+// ---------------------------------------------------------------------------
+
+namespace {
+// Elementwise scale by half (used by EBF residuals: x + 0.5 * branch).
+ggml_tensor * scale_half(ggml_context * ctx, ggml_tensor * x) {
+    return ggml_scale(ctx, x, 0.5f);
+}
+}  // namespace
+
+ggml_tensor * ebf_block(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    const EBFBlockWeights & W,
+    ggml_tensor * positions,
+    int num_heads,
+    int head_dim,
+    float theta) {
+    // FFN 1 (pre-attention)
+    if (W.has_ffn1) {
+        ggml_tensor * h = rms_norm(ctx, x, W.w_norm1);
+        h = glu_ffn(ctx, h, W.w_ffn1_ln1, W.b_ffn1_ln1, W.w_ffn1_ln2, W.b_ffn1_ln2);
+        if (W.w_lay_scale1) h = layer_scale(ctx, h, W.w_lay_scale1);
+        h = scale_half(ctx, h);
+        x = ggml_add(ctx, x, h);
+    }
+
+    // PAC
+    ggml_tensor * p = pac(ctx, x, W.pac_w, positions, num_heads, head_dim, theta);
+    if (W.w_lay_scale2) p = layer_scale(ctx, p, W.w_lay_scale2);
+    x = ggml_add(ctx, x, p);
+
+    // FFN 2 (post-attention)
+    if (W.has_ffn2) {
+        ggml_tensor * h = rms_norm(ctx, x, W.w_norm2);
+        h = glu_ffn(ctx, h, W.w_ffn2_ln1, W.b_ffn2_ln1, W.w_ffn2_ln2, W.b_ffn2_ln2);
+        if (W.w_lay_scale3) h = layer_scale(ctx, h, W.w_lay_scale3);
+        h = scale_half(ctx, h);
+        x = ggml_add(ctx, x, h);
+    }
+
+    return x;
+}
+
+}  // namespace game_ggml::internal::ops
