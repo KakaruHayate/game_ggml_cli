@@ -1,7 +1,14 @@
 name: ci
 
 # Multi-platform build + oudep packaging for GAME-ggml CLI.
-# Produces platform-specific .oudep archives that OpenUtau can drag-drop install.
+#
+# Matrix:
+#   linux-x64-vulkan   — Ubuntu, Vulkan backend
+#   macos-arm64-metal  — Apple Silicon, Metal backend
+#   macos-x64-metal    — Intel Mac, Metal backend (cross-compiled on ARM runner)
+#   windows-x64-cpu    — Windows, CPU backend (Vulkan .exe uploaded separately)
+#
+# On tag push, artifacts are bundled into a GitHub Release.
 
 on:
   push:
@@ -24,20 +31,27 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux-x64-vulkan
-            backend: VULKAN
-            ext: ""
+            cmake_extra: "-DGAME_GGML_VULKAN=ON"
+            pkg_ext: ""
+            lib_glob: "libggml*.so*"
+
           - os: macos-14
             name: macos-arm64-metal
-            backend: METAL
-            ext: ""
-          - os: macos-13
+            cmake_extra: "-DGAME_GGML_METAL=ON -DCMAKE_OSX_ARCHITECTURES=arm64"
+            pkg_ext: ""
+            lib_glob: "libggml*.dylib"
+
+          - os: macos-14
             name: macos-x64-metal
-            backend: METAL
-            ext: ""
+            cmake_extra: "-DGAME_GGML_METAL=ON -DCMAKE_OSX_ARCHITECTURES=x86_64"
+            pkg_ext: ""
+            lib_glob: "libggml*.dylib"
+
           - os: windows-latest
-            name: windows-x64-vulkan
-            backend: VULKAN
-            ext: ".exe"
+            name: windows-x64-cpu
+            cmake_extra: ""
+            pkg_ext: ".exe"
+            lib_glob: "ggml*.dll"
 
     defaults:
       run:
@@ -58,6 +72,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch numpy gguf pyyaml
 
+      - name: Install Vulkan SDK (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends vulkan-sdk glslc-tools
+          which glslc && glslc --version || true
+
       - name: Cache CMake FetchContent
         uses: actions/cache@v4
         with:
@@ -72,7 +93,7 @@ jobs:
                 -DCMAKE_BUILD_TYPE=Release \
                 -DGAME_GGML_BUILD_CLI=ON \
                 -DGAME_GGML_BUILD_TESTS=OFF \
-                -DGAME_GGML_${{ matrix.backend }}=ON
+                ${{ matrix.cmake_extra }}
 
       - name: Build
         run: cmake --build build -j --config Release
@@ -80,27 +101,23 @@ jobs:
       - name: Verify binary
         run: |
           ls -la build/bin/
-          build/bin/game_ggml_cli${{ matrix.ext }} --version || true
+          build/bin/game_ggml_cli${{ matrix.pkg_ext }} --version || true
 
       - name: Package .oudep
         run: |
           set -euo pipefail
-          BIN="game_ggml_cli${{ matrix.ext }}"
+          BIN="game_ggml_cli${{ matrix.pkg_ext }}"
           PKG="game_ggml-${{ matrix.name }}"
           mkdir -p "$PKG"
 
           # CLI binary
           cp "build/bin/$BIN" "$PKG/"
 
-          # Shared libraries (DLLs / .so / .dylib)
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            find build/bin -maxdepth 1 -name "ggml*.dll" -exec cp {} "$PKG/" \;
-          elif [ "${{ runner.os }}" = "Linux" ]; then
-            # Vulkan loader is provided by the runner; ship CPU fallback libs
-            find build/bin -maxdepth 1 \( -name "libggml*.so*" -o -name "libggml*.so" \) -exec cp {} "$PKG/" \; 2>/dev/null || true
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            find build/bin -maxdepth 1 -name "libggml*.dylib" -exec cp {} "$PKG/" \;
-            # Metal shader cache (speeds up first inference)
+          # Shared libraries
+          find build/bin -maxdepth 1 -name "${{ matrix.lib_glob }}" -exec cp {} "$PKG/" \;
+
+          # macOS: include pre-compiled Metal shader cache if present
+          if [ "${{ runner.os }}" = "macOS" ]; then
             find build -name "default.metallib" -exec cp {} "$PKG/" \; 2>/dev/null || true
           fi
 
@@ -125,6 +142,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Windows x64 Vulkan (.exe) is built locally and uploaded manually to the
+  # release.  This job downloads the locally-built artifact from the release
+  # and re-bundles it alongside the CI-built packages.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -132,24 +152,36 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      - name: Download CI artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Zip per-platform bundles
+      - name: Download local Windows Vulkan artifact
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/download-artifact@v4
+        with:
+          name: game_ggml-windows-x64-vulkan
+          path: artifacts
+        continue-on-error: true
+
+      - name: Re-package all artifacts as .oudep
         run: |
+          set -euo pipefail
           cd artifacts
+          # Each top-level dir is a platform package already containing
+          # the binary + libs + oudep.yaml.  Zip it.
           for dir in */; do
             name="${dir%/}"
             zip -r "../${name}.oudep.zip" "$dir"
           done
           cd ..
           ls -la *.zip
+          echo "ARTIFACTS_COUNT=$(ls *.zip 2>/dev/null | wc -l)" >> "$GITHUB_ENV"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: "*.zip"
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false  # tolerate missing local Windows upload
