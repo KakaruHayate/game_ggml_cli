@@ -79,6 +79,24 @@ jobs:
           vulkan-query-version: latest
           vulkan-components: Vulkan-Headers,Vulkan-Loader
           vulkan-use-cache: true
+      - name: Add glslc to PATH (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The action extracts SDK under the workspace; search for glslc.
+          GLSC=$(find "${{ github.workspace }}" -name "glslc" -type f 2>/dev/null | head -1)
+          if [ -z "$GLSC" ]; then
+            GLSC=$(find /usr/local -name "glslc" -type f 2>/dev/null | head -1)
+          fi
+          if [ -n "$GLSC" ]; then
+            BIN_DIR=$(dirname "$GLSC")
+            echo "$BIN_DIR" >> "$GITHUB_PATH"
+            echo "Added $BIN_DIR to PATH (glslc=$GLSC)"
+          else
+            echo "::error::glslc not found after Vulkan SDK install"
+            exit 1
+          fi
+          which glslc && glslc --version
 
       - name: Install Vulkan SDK (Windows only)
         if: runner.os == 'Windows'
@@ -87,6 +105,27 @@ jobs:
           vulkan-query-version: latest
           vulkan-components: Vulkan-Headers,Vulkan-Loader
           vulkan-use-cache: true
+      - name: Add glslc to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $glslc = Get-Command glslc -ErrorAction SilentlyContinue
+          if (-not $glslc) {
+            # Search common locations
+            $dirs = @(
+              Join-Path $env:VULKAN_SDK 'Bin',
+              'C:\VulkanSDK\Bin',
+              'C:\Program Files\VulkanSDK\Bin'
+            )
+            foreach ($d in $dirs) {
+              if (Test-Path (Join-Path $d 'glslc.exe')) {
+                $env:PATH = "$d;$env:PATH"
+                Write-Host "Added $d to PATH"
+                break
+              }
+            }
+          }
+          Get-Command glslc | Select-Object Source
 
       - name: Cache CMake FetchContent
         uses: actions/cache@v4
