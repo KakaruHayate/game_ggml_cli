@@ -48,8 +48,8 @@ jobs:
             lib_glob: "libggml*.dylib"
 
           - os: windows-latest
-            name: windows-x64-cpu
-            cmake_extra: ""
+            name: windows-x64-vulkan
+            cmake_extra: "-DGAME_GGML_VULKAN=ON"
             pkg_ext: ".exe"
             lib_glob: "ggml*.dll"
 
@@ -74,7 +74,14 @@ jobs:
 
       - name: Install Vulkan SDK (Linux only)
         if: runner.os == 'Linux'
-        uses: LunarG/setup-vulkan-sdk@v1
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          version: latest
+          cache: true
+
+      - name: Install Vulkan SDK (Windows only)
+        if: runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           version: latest
           cache: true
