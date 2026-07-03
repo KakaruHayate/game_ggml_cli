@@ -74,10 +74,10 @@ jobs:
 
       - name: Install Vulkan SDK (Linux only)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends vulkan-sdk glslc-tools
-          which glslc && glslc --version || true
+        uses: LunarG/setup-vulkan-sdk@v1
+        with:
+          version: latest
+          cache: true
 
       - name: Cache CMake FetchContent
         uses: actions/cache@v4
